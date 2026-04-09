@@ -632,6 +632,59 @@ def write_TM(fp: DicomIO, elem: DataElement) -> None:
         fp.write(val)
 
 
+def _validate_undefined_length_pixel_data(
+    fp: DicomIO,
+    elem: DataElement | RawDataElement,
+    is_undefined_length: bool,
+) -> None:
+    """Validate encapsulation for undefined length Pixel Data."""
+    if not is_undefined_length or elem.tag != 0x7FE00010:
+        return
+
+    if elem.is_buffered:
+        value = cast(BufferedIOBase, elem.value)
+        with reset_buffer_position(value):
+            pixel_data_bytes = value.read(4)
+    else:
+        pixel_data_bytes = cast(bytes, elem.value)[:4]
+
+    # Big endian encapsulation is non-conformant
+    tag = b"\xfe\xff\x00\xe0" if fp.is_little_endian else b"\xff\xfe\xe0\x00"
+    if not pixel_data_bytes.startswith(tag):
+        raise ValueError(
+            "The (7FE0,0010) 'Pixel Data' element value hasn't been "
+            "encapsulated as required for a compressed transfer syntax - "
+            "see pydicom.encaps.encapsulate() for more information"
+        )
+
+
+def _write_element_vr_and_length(
+    fp: DicomIO,
+    vr: str | None,
+    is_undefined_length: bool,
+    value_length: int,
+) -> None:
+    """Write VR and length fields for `write_data_element`."""
+    # write the VR for explicit transfer syntax
+    if not fp.is_implicit_VR:
+        vr = cast(str, vr)
+        fp.write(bytes(vr, default_encoding))
+
+        if vr in EXPLICIT_VR_LENGTH_32:
+            fp.write_US(0)  # reserved 2 bytes
+
+    if (
+        not fp.is_implicit_VR
+        and vr not in EXPLICIT_VR_LENGTH_32
+        and not is_undefined_length
+    ):
+        fp.write_US(value_length)  # Explicit VR length field is 2 bytes
+    else:
+        # write the proper length of the data_element in the length slot,
+        # unless is SQ with undefined length.
+        fp.write_UL(0xFFFFFFFF if is_undefined_length else value_length)
+
+
 def write_data_element(
     fp: DicomIO,
     elem: DataElement | RawDataElement,
@@ -686,24 +739,9 @@ def write_data_element(
                     # tag and length in the file
                     fn(buffer, elem)  # type: ignore[operator]
 
-    # valid pixel data with undefined length shall contain encapsulated
-    # data, e.g. sequence items - raise ValueError otherwise (see #238)
-    if is_undefined_length and elem.tag == 0x7FE00010:
-        if elem.is_buffered:
-            value = cast(BufferedIOBase, elem.value)
-            with reset_buffer_position(value):
-                pixel_data_bytes = value.read(4)
-        else:
-            pixel_data_bytes = cast(bytes, elem.value)[:4]
-
-        # Big endian encapsulation is non-conformant
-        tag = b"\xfe\xff\x00\xe0" if fp.is_little_endian else b"\xff\xfe\xe0\x00"
-        if not pixel_data_bytes.startswith(tag):
-            raise ValueError(
-                "The (7FE0,0010) 'Pixel Data' element value hasn't been "
-                "encapsulated as required for a compressed transfer syntax - "
-                "see pydicom.encaps.encapsulate() for more information"
-            )
+    # Refactor (Simplify Conditional Logic): extracted undefined-length Pixel Data
+    # validation to a helper to reduce branching in write_data_element.
+    _validate_undefined_length_pixel_data(fp, elem, is_undefined_length)
 
     value_length = (
         buffer.tell()
@@ -726,24 +764,9 @@ def write_data_element(
         )
         vr = VR.UN
 
-    # write the VR for explicit transfer syntax
-    if not fp.is_implicit_VR:
-        vr = cast(str, vr)
-        fp.write(bytes(vr, default_encoding))
-
-        if vr in EXPLICIT_VR_LENGTH_32:
-            fp.write_US(0)  # reserved 2 bytes
-
-    if (
-        not fp.is_implicit_VR
-        and vr not in EXPLICIT_VR_LENGTH_32
-        and not is_undefined_length
-    ):
-        fp.write_US(value_length)  # Explicit VR length field is 2 bytes
-    else:
-        # write the proper length of the data_element in the length slot,
-        # unless is SQ with undefined length.
-        fp.write_UL(0xFFFFFFFF if is_undefined_length else value_length)
+    # Refactor (Simplify Conditional Logic): extracted VR/length field writing
+    # to centralize conditional rules for explicit/implicit encodings.
+    _write_element_vr_and_length(fp, vr, is_undefined_length, value_length)
 
     # if the value is buffered, now we want to write the value directly to the fp
     if elem.is_buffered:
