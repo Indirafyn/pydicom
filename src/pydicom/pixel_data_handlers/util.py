@@ -95,24 +95,26 @@ _DEPRECATED_UTIL = {
     "pixel_dtype": _pixel_dtype,
     "reshape_pixel_array": _reshape_pixel_array,
 }
+_DEPRECATED_REDIRECTS: dict[str, tuple[Any, str]] = {
+    **{name: (value, "pydicom.pixels") for name, value in _DEPRECATED.items()},
+    **{
+        name: (value, "pydicom.pixels.utils")
+        for name, value in _DEPRECATED_UTIL.items()
+    },
+}
 
 
 def __getattr__(name: str) -> Any:
-    if name in _DEPRECATED and not config._use_future:
+    # Refactor (Replace Repeated Conditionals with Table-Driven Dispatch):
+    # unify deprecated attribute redirects in a single lookup table.
+    if name in _DEPRECATED_REDIRECTS and not config._use_future:
+        value, target = _DEPRECATED_REDIRECTS[name]
         msg = (
             "The 'pydicom.pixel_data_handlers' module will be removed "
-            f"in v4.0, please use 'from pydicom.pixels import {name}' instead"
+            f"in v4.0, please use 'from {target} import {name}' instead"
         )
         warn_and_log(msg, DeprecationWarning)
-        return _DEPRECATED[name]
-
-    if name in _DEPRECATED_UTIL and not config._use_future:
-        msg = (
-            "The 'pydicom.pixel_data_handlers' module will be removed "
-            f"in v4.0, please use 'from pydicom.pixels.utils import {name}' instead"
-        )
-        warn_and_log(msg, DeprecationWarning)
-        return _DEPRECATED_UTIL[name]
+        return value
 
     if name == "dtype_corrected_for_endianness" and not config._use_future:
         msg = (

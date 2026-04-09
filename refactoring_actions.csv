@@ -1,0 +1,265 @@
+filename,code element,line numbers,original code,refactored code,refactoring type
+src/pydicom/filereader.py,data_element_generator() header parsing loop,"original: 147-189; refactored: 53-105, 210-219","        if is_implicit_VR:
+            # must reset VR each time; could have set last iteration (e.g. SQ)
+            vr = None
+            group, elem, length = element_struct_unpack(bytes_read)
+        else:  # explicit VR
+            group, elem, vr, length = element_struct_unpack(bytes_read)
+            # defend against switching to implicit VR, some writer do in SQ's
+            # issue 1067, issue 1035
+
+            if vr in ENCODED_VR:  # try most likely solution first
+                vr = vr.decode(default_encoding)
+                if vr in EXPLICIT_VR_LENGTH_32:
+                    bytes_read = fp_read(4)
+                    length = extra_length_unpack(bytes_read)[0]
+                    if debugging:
+                        debug_msg += "" "" + bytes2hex(bytes_read)
+            elif not (b""AA"" <= vr <= b""ZZ"") and config.assume_implicit_vr_switch:
+                # invalid VR, must be 2 cap chrs, assume implicit and continue
+                if debugging:
+                    logger.warning(
+                        f""Unknown VR '0x{vr[0]:02x}{vr[1]:02x}' assuming ""
+                        ""implicit VR encoding""
+                    )
+                vr = None
+                group, elem, length = implicit_VR_unpack(bytes_read)
+                if group == 2:
+                    # as the metadata is expected to be explicit VR, we lookup the VR
+                    # to be able to write it back with the correct transfer syntax
+                    try:
+                        vr = _dictionary_vr_fast(TupleTag((group, elem)))
+                    except KeyError:
+                        vr = ""UN""
+            else:
+                # Either an unimplemented VR or implicit VR encoding
+                # Note that we treat an unimplemented VR as having a 2-byte
+                #   length, but that may not be correct
+                vr = vr.decode(default_encoding)
+                if debugging:
+                    logger.warning(
+                        f""Unknown VR '{vr}' assuming explicit VR encoding with ""
+                        ""2-byte length""
+                    )
+","def _read_tag_vr_length(
+    bytes_read: bytes,
+    is_implicit_VR: bool,
+    implicit_VR_unpack: Callable[[bytes], tuple[int, int, int]],
+    element_struct_unpack: Any,
+    extra_length_unpack: Callable[[bytes], tuple[int]] | None,
+    fp_read: Callable[[int], bytes],
+    debugging: bool,
+) -> tuple[int, int, str | None, int, bytes]:
+    """"""Return the tag group, element, VR and length from `bytes_read`.""""""
+    extra_bytes = b""""
+    if is_implicit_VR:
+        # must reset VR each time; could have set last iteration (e.g. SQ)
+        vr: str | None = None
+        group, elem, length = implicit_VR_unpack(bytes_read)
+        return group, elem, vr, length, extra_bytes
+
+    group, elem, vr_raw, length = cast(
+        tuple[int, int, bytes, int], element_struct_unpack(bytes_read)
+    )
+    # defend against switching to implicit VR, some writer do in SQ's
+    # issue 1067, issue 1035
+    if vr_raw in ENCODED_VR:  # try most likely solution first
+        vr = vr_raw.decode(default_encoding)
+        if vr in EXPLICIT_VR_LENGTH_32 and extra_length_unpack is not None:
+            extra_bytes = fp_read(4)
+            length = extra_length_unpack(extra_bytes)[0]
+    elif not (b""AA"" <= vr_raw <= b""ZZ"") and config.assume_implicit_vr_switch:
+        # invalid VR, must be 2 cap chrs, assume implicit and continue
+        if debugging:
+            logger.warning(
+                f""Unknown VR '0x{vr_raw[0]:02x}{vr_raw[1]:02x}' assuming ""
+                ""implicit VR encoding""
+            )
+        vr = None
+        group, elem, length = implicit_VR_unpack(bytes_read)
+        if group == 2:
+            # as the metadata is expected to be explicit VR, we lookup the VR
+            # to be able to write it back with the correct transfer syntax
+            try:
+                vr = _dictionary_vr_fast(TupleTag((group, elem)))
+            except KeyError:
+                vr = ""UN""
+    else:
+        # Either an unimplemented VR or implicit VR encoding
+        # Note that we treat an unimplemented VR as having a 2-byte
+        #   length, but that may not be correct
+        vr = vr_raw.decode(default_encoding)
+        if debugging:
+            logger.warning(
+                f""Unknown VR '{vr}' assuming explicit VR encoding with ""
+                ""2-byte length""
+            )
+...
+        # Refactor (Extract Method): moved header parsing branches to helper.
+        group, elem, vr, length, extra_bytes = _read_tag_vr_length(
+            bytes_read,
+            is_implicit_VR,
+            implicit_VR_unpack,
+            element_struct_unpack,
+            extra_length_unpack,
+            fp_read,
+            debugging,
+        )",Extract Method
+src/pydicom/filereader.py,read_partial() transfer syntax selection,"original: 889-895, 920-923; refactored: 46-50, 948-955","    elif transfer_syntax == pydicom.uid.ImplicitVRLittleEndian:
+        pass
+    elif transfer_syntax == pydicom.uid.ExplicitVRLittleEndian:
+        is_implicit_VR = False
+    elif transfer_syntax == pydicom.uid.ExplicitVRBigEndian:
+        is_implicit_VR = False
+        is_little_endian = False
+...
+        # Any other syntax should be Explicit VR Little Endian,
+        #   e.g. all Encapsulated (JPEG etc) are ExplVR-LE
+        #        by Standard PS 3.5-2008 A.4 (p63)
+        is_implicit_VR = False","_TRANSFER_SYNTAX_ENCODING = {
+    pydicom.uid.ImplicitVRLittleEndian: (True, True),
+    pydicom.uid.ExplicitVRLittleEndian: (False, True),
+    pydicom.uid.ExplicitVRBigEndian: (False, False),
+}
+...
+        encoding = _TRANSFER_SYNTAX_ENCODING.get(transfer_syntax)
+        if encoding is not None:
+            is_implicit_VR, is_little_endian = encoding
+        else:
+            # Any other syntax should be Explicit VR Little Endian,
+            #   e.g. all Encapsulated (JPEG etc) are ExplVR-LE
+            #        by Standard PS 3.5-2008 A.4 (p63)
+            is_implicit_VR = False",Replace Conditional with Strategy (table-driven dispatch)
+src/pydicom/filereader.py,read_deferred_data_element() filename checks,original: 1157-1159; refactored: 1191-1193,"    is_filename = isinstance(filename_or_obj, str)
+    if isinstance(filename_or_obj, str):
+        if not os.path.exists(filename_or_obj):","    is_filename = isinstance(filename_or_obj, str)
+    if is_filename:
+        if not os.path.exists(filename_or_obj):",Consolidate Duplicate Conditional Fragments
+src/pydicom/filewriter.py,write_data_element() undefined-length validation and VR/length writes,"original: 689-706, 729-746; refactored: 635-689, 744, 769","    # valid pixel data with undefined length shall contain encapsulated
+    # data, e.g. sequence items - raise ValueError otherwise (see #238)
+    if is_undefined_length and elem.tag == 0x7FE00010:
+        if elem.is_buffered:
+            value = cast(BufferedIOBase, elem.value)
+            with reset_buffer_position(value):
+                pixel_data_bytes = value.read(4)
+        else:
+            pixel_data_bytes = cast(bytes, elem.value)[:4]
+
+        # Big endian encapsulation is non-conformant
+        tag = b""\xfe\xff\x00\xe0"" if fp.is_little_endian else b""\xff\xfe\xe0\x00""
+        if not pixel_data_bytes.startswith(tag):
+            raise ValueError(
+                ""The (7FE0,0010) 'Pixel Data' element value hasn't been ""
+                ""encapsulated as required for a compressed transfer syntax - ""
+                ""see pydicom.encaps.encapsulate() for more information""
+            )
+...
+    # write the VR for explicit transfer syntax
+    if not fp.is_implicit_VR:
+        vr = cast(str, vr)
+        fp.write(bytes(vr, default_encoding))
+
+        if vr in EXPLICIT_VR_LENGTH_32:
+            fp.write_US(0)  # reserved 2 bytes
+
+    if (
+        not fp.is_implicit_VR
+        and vr not in EXPLICIT_VR_LENGTH_32
+        and not is_undefined_length
+    ):
+        fp.write_US(value_length)  # Explicit VR length field is 2 bytes
+    else:
+        # write the proper length of the data_element in the length slot,
+        # unless is SQ with undefined length.
+        fp.write_UL(0xFFFFFFFF if is_undefined_length else value_length)","def _validate_undefined_length_pixel_data(
+    fp: DicomIO,
+    elem: DataElement | RawDataElement,
+    is_undefined_length: bool,
+) -> None:
+    """"""Validate encapsulation for undefined length Pixel Data.""""""
+    if not is_undefined_length or elem.tag != 0x7FE00010:
+        return
+
+    if elem.is_buffered:
+        value = cast(BufferedIOBase, elem.value)
+        with reset_buffer_position(value):
+            pixel_data_bytes = value.read(4)
+    else:
+        pixel_data_bytes = cast(bytes, elem.value)[:4]
+
+    # Big endian encapsulation is non-conformant
+    tag = b""\xfe\xff\x00\xe0"" if fp.is_little_endian else b""\xff\xfe\xe0\x00""
+    if not pixel_data_bytes.startswith(tag):
+        raise ValueError(
+            ""The (7FE0,0010) 'Pixel Data' element value hasn't been ""
+            ""encapsulated as required for a compressed transfer syntax - ""
+            ""see pydicom.encaps.encapsulate() for more information""
+        )
+
+
+def _write_element_vr_and_length(
+    fp: DicomIO,
+    vr: str | None,
+    is_undefined_length: bool,
+    value_length: int,
+) -> None:
+    """"""Write VR and length fields for `write_data_element`.""""""
+    # write the VR for explicit transfer syntax
+    if not fp.is_implicit_VR:
+        vr = cast(str, vr)
+        fp.write(bytes(vr, default_encoding))
+
+        if vr in EXPLICIT_VR_LENGTH_32:
+            fp.write_US(0)  # reserved 2 bytes
+
+    if (
+        not fp.is_implicit_VR
+        and vr not in EXPLICIT_VR_LENGTH_32
+        and not is_undefined_length
+    ):
+        fp.write_US(value_length)  # Explicit VR length field is 2 bytes
+    else:
+        # write the proper length of the data_element in the length slot,
+        # unless is SQ with undefined length.
+        fp.write_UL(0xFFFFFFFF if is_undefined_length else value_length)
+
+
+def write_data_element(
+    fp: DicomIO,
+...
+    _validate_undefined_length_pixel_data(fp, elem, is_undefined_length)
+    _write_element_vr_and_length(fp, vr, is_undefined_length, value_length)",Simplify Conditional Logic (Extract Method)
+src/pydicom/pixel_data_handlers/util.py,__getattr__() deprecated redirects,original: 101-115; refactored: 98-117,"    if name in _DEPRECATED and not config._use_future:
+        msg = (
+            ""The 'pydicom.pixel_data_handlers' module will be removed ""
+            f""in v4.0, please use 'from pydicom.pixels import {name}' instead""
+        )
+        warn_and_log(msg, DeprecationWarning)
+        return _DEPRECATED[name]
+
+    if name in _DEPRECATED_UTIL and not config._use_future:
+        msg = (
+            ""The 'pydicom.pixel_data_handlers' module will be removed ""
+            f""in v4.0, please use 'from pydicom.pixels.utils import {name}' instead""
+        )
+        warn_and_log(msg, DeprecationWarning)
+        return _DEPRECATED_UTIL[name]","_DEPRECATED_REDIRECTS: dict[str, tuple[Any, str]] = {
+    **{name: (value, ""pydicom.pixels"") for name, value in _DEPRECATED.items()},
+    **{
+        name: (value, ""pydicom.pixels.utils"")
+        for name, value in _DEPRECATED_UTIL.items()
+    },
+}
+
+
+def __getattr__(name: str) -> Any:
+    # Refactor (Replace Repeated Conditionals with Table-Driven Dispatch):
+    # unify deprecated attribute redirects in a single lookup table.
+    if name in _DEPRECATED_REDIRECTS and not config._use_future:
+        value, target = _DEPRECATED_REDIRECTS[name]
+        msg = (
+            ""The 'pydicom.pixel_data_handlers' module will be removed ""
+            f""in v4.0, please use 'from {target} import {name}' instead""
+        )
+        warn_and_log(msg, DeprecationWarning)
+        return value",Replace Repeated Conditionals with Table-Driven Dispatch

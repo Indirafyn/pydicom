@@ -43,6 +43,68 @@ from pydicom.valuerep import EXPLICIT_VR_LENGTH_32, VR as VR_
 
 
 ENCODED_VR = {vr.encode(default_encoding) for vr in VR_}
+_TRANSFER_SYNTAX_ENCODING = {
+    pydicom.uid.ImplicitVRLittleEndian: (True, True),
+    pydicom.uid.ExplicitVRLittleEndian: (False, True),
+    pydicom.uid.ExplicitVRBigEndian: (False, False),
+}
+
+
+def _read_tag_vr_length(
+    bytes_read: bytes,
+    is_implicit_VR: bool,
+    implicit_VR_unpack: Callable[[bytes], tuple[int, int, int]],
+    element_struct_unpack: Any,
+    extra_length_unpack: Callable[[bytes], tuple[int]] | None,
+    fp_read: Callable[[int], bytes],
+    debugging: bool,
+) -> tuple[int, int, str | None, int, bytes]:
+    """Return the tag group, element, VR and length from `bytes_read`."""
+    extra_bytes = b""
+    if is_implicit_VR:
+        # must reset VR each time; could have set last iteration (e.g. SQ)
+        vr: str | None = None
+        group, elem, length = implicit_VR_unpack(bytes_read)
+        return group, elem, vr, length, extra_bytes
+
+    group, elem, vr_raw, length = cast(
+        tuple[int, int, bytes, int], element_struct_unpack(bytes_read)
+    )
+    # defend against switching to implicit VR, some writer do in SQ's
+    # issue 1067, issue 1035
+    if vr_raw in ENCODED_VR:  # try most likely solution first
+        vr = vr_raw.decode(default_encoding)
+        if vr in EXPLICIT_VR_LENGTH_32 and extra_length_unpack is not None:
+            extra_bytes = fp_read(4)
+            length = extra_length_unpack(extra_bytes)[0]
+    elif not (b"AA" <= vr_raw <= b"ZZ") and config.assume_implicit_vr_switch:
+        # invalid VR, must be 2 cap chrs, assume implicit and continue
+        if debugging:
+            logger.warning(
+                f"Unknown VR '0x{vr_raw[0]:02x}{vr_raw[1]:02x}' assuming "
+                "implicit VR encoding"
+            )
+        vr = None
+        group, elem, length = implicit_VR_unpack(bytes_read)
+        if group == 2:
+            # as the metadata is expected to be explicit VR, we lookup the VR
+            # to be able to write it back with the correct transfer syntax
+            try:
+                vr = _dictionary_vr_fast(TupleTag((group, elem)))
+            except KeyError:
+                vr = "UN"
+    else:
+        # Either an unimplemented VR or implicit VR encoding
+        # Note that we treat an unimplemented VR as having a 2-byte
+        #   length, but that may not be correct
+        vr = vr_raw.decode(default_encoding)
+        if debugging:
+            logger.warning(
+                f"Unknown VR '{vr}' assuming explicit VR encoding with "
+                "2-byte length"
+            )
+
+    return group, elem, vr, length, extra_bytes
 
 # disable some code complexity checks due to performance-relevant code
 # ruff: noqa: C901, PLR0912, PLR0915
@@ -115,6 +177,7 @@ def data_element_generator(
 
     # assign implicit VR struct to variable as use later if VR assumed missing
     implicit_VR_unpack = Struct(f"{endian_chr}HHL").unpack
+    extra_length_unpack: Callable[[bytes], tuple[int]] | None = None
     if is_implicit_VR:
         element_struct_unpack = implicit_VR_unpack
     else:  # Explicit VR
@@ -144,48 +207,18 @@ def data_element_generator(
         if debugging:
             debug_msg = f"{fp.tell() - 8:08x}: {bytes2hex(bytes_read)}"
 
-        if is_implicit_VR:
-            # must reset VR each time; could have set last iteration (e.g. SQ)
-            vr = None
-            group, elem, length = element_struct_unpack(bytes_read)
-        else:  # explicit VR
-            group, elem, vr, length = element_struct_unpack(bytes_read)
-            # defend against switching to implicit VR, some writer do in SQ's
-            # issue 1067, issue 1035
-
-            if vr in ENCODED_VR:  # try most likely solution first
-                vr = vr.decode(default_encoding)
-                if vr in EXPLICIT_VR_LENGTH_32:
-                    bytes_read = fp_read(4)
-                    length = extra_length_unpack(bytes_read)[0]
-                    if debugging:
-                        debug_msg += " " + bytes2hex(bytes_read)
-            elif not (b"AA" <= vr <= b"ZZ") and config.assume_implicit_vr_switch:
-                # invalid VR, must be 2 cap chrs, assume implicit and continue
-                if debugging:
-                    logger.warning(
-                        f"Unknown VR '0x{vr[0]:02x}{vr[1]:02x}' assuming "
-                        "implicit VR encoding"
-                    )
-                vr = None
-                group, elem, length = implicit_VR_unpack(bytes_read)
-                if group == 2:
-                    # as the metadata is expected to be explicit VR, we lookup the VR
-                    # to be able to write it back with the correct transfer syntax
-                    try:
-                        vr = _dictionary_vr_fast(TupleTag((group, elem)))
-                    except KeyError:
-                        vr = "UN"
-            else:
-                # Either an unimplemented VR or implicit VR encoding
-                # Note that we treat an unimplemented VR as having a 2-byte
-                #   length, but that may not be correct
-                vr = vr.decode(default_encoding)
-                if debugging:
-                    logger.warning(
-                        f"Unknown VR '{vr}' assuming explicit VR encoding with "
-                        "2-byte length"
-                    )
+        # Refactor (Extract Method): moved header parsing branches to helper.
+        group, elem, vr, length, extra_bytes = _read_tag_vr_length(
+            bytes_read,
+            is_implicit_VR,
+            implicit_VR_unpack,
+            element_struct_unpack,
+            extra_length_unpack,
+            fp_read,
+            debugging,
+        )
+        if debugging and extra_bytes:
+            debug_msg += " " + bytes2hex(extra_bytes)
 
         if debugging:
             debug_msg = f"{debug_msg:<47s}  ({group:04X},{elem:04X})"
@@ -886,13 +919,6 @@ def read_partial(
             #   and hope for the best (big endian is retired anyway)
             if group >= 1024:
                 is_little_endian = False
-    elif transfer_syntax == pydicom.uid.ImplicitVRLittleEndian:
-        pass
-    elif transfer_syntax == pydicom.uid.ExplicitVRLittleEndian:
-        is_implicit_VR = False
-    elif transfer_syntax == pydicom.uid.ExplicitVRBigEndian:
-        is_implicit_VR = False
-        is_little_endian = False
     elif transfer_syntax == pydicom.uid.DeflatedExplicitVRLittleEndian:
         # See PS3.5 section A.5
         # when written, the entire dataset following
@@ -917,10 +943,16 @@ def read_partial(
         is_implicit_VR = transfer_syntax.is_implicit_VR
         is_little_endian = transfer_syntax.is_little_endian
     else:
-        # Any other syntax should be Explicit VR Little Endian,
-        #   e.g. all Encapsulated (JPEG etc) are ExplVR-LE
-        #        by Standard PS 3.5-2008 A.4 (p63)
-        is_implicit_VR = False
+        # Refactor (Replace Conditional with Strategy): use table-driven encoding lookup
+        # for standard transfer syntaxes and keep explicit fallback behavior.
+        encoding = _TRANSFER_SYNTAX_ENCODING.get(transfer_syntax)
+        if encoding is not None:
+            is_implicit_VR, is_little_endian = encoding
+        else:
+            # Any other syntax should be Explicit VR Little Endian,
+            #   e.g. all Encapsulated (JPEG etc) are ExplVR-LE
+            #        by Standard PS 3.5-2008 A.4 (p63)
+            is_implicit_VR = False
 
     # Try and decode the dataset
     #   By this point we should be at the start of the dataset and have
@@ -1154,8 +1186,10 @@ def read_deferred_data_element(
         raise OSError("Deferred read -- original filename not stored. Cannot re-open")
 
     # Check that the file is the same as when originally read
+    # Refactor (Consolidate Duplicate Conditional Fragments): evaluate type once and
+    # reuse the boolean for all filename-specific checks.
     is_filename = isinstance(filename_or_obj, str)
-    if isinstance(filename_or_obj, str):
+    if is_filename:
         if not os.path.exists(filename_or_obj):
             raise OSError(
                 f"Deferred read -- original file {filename_or_obj} is missing"
